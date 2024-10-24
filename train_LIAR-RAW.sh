@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0; python source/extractor_train.py --model_name_or_path roberta-base --dataset_name LIAR_RAW --output_dir ./runnings/step1_extraction_model_LIAR-RAW --do_train --train_batch_size 2 --num_train_epochs 5 --eval_batch_size 32 --eval_steps 500 --max_seq_len 64 --gradient_accumulation_steps 1 --correlation_method mlp --learning_rate 1e-5 --cls_loss_weight 0.9
