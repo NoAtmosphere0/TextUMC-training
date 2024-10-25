@@ -4,7 +4,7 @@ from os.path import join as pjoin
 from help import *
 
 
-HOME_DIR = BASE_DIR + "/L-Defense_EFND/"
+HOME_DIR = BASE_DIR + "/thesis-test-code/"
 
 
 DATASET2PATH = {
