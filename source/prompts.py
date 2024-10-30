@@ -1,7 +1,8 @@
 from openai import OpenAI
+import os
 
-OPENAI_KEY = "YOUR_KEY"
-OPENAI_BASE = "YOUR_URL"
+OPENAI_KEY = os.getenv("OPENAI_KEY")
+OPENAI_BASE = os.getenv("OPENAI_BASE")
 client = OpenAI(api_key=OPENAI_KEY, base_url=OPENAI_BASE)
 
 EXPLANATION_SYSTEM_PROMPT_v0 = f"""\
@@ -24,4 +25,3 @@ Below are some sentences that may be helpful for the explanation, but they are m
 [SENTENCES]
 Note, please do not repeat the claim and the label in your explanation, just directly output your streamlined rationale.
 """
-
