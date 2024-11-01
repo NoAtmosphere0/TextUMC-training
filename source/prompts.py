@@ -2,7 +2,7 @@ from openai import OpenAI
 import os
 
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_BASE = os.getenv("OPENAI_BASE")
+OPENAI_BASE = "https://api.openai.com/v1"
 client = OpenAI(api_key=OPENAI_KEY, base_url=OPENAI_BASE)
 
 EXPLANATION_SYSTEM_PROMPT_v0 = f"""\

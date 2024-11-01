@@ -1,1 +1,1 @@
-CUDA_VISIBLE_DEVICES=0 python ./thesis-test-code/source/step2_explanation_generation.py --dataset_name LIAR-RAW_step2 --output_dir ./dataset/RAWFC_step2 --generate_explanation_gpt 
+CUDA_VISIBLE_DEVICES=0; python ./thesis-test-code/source/step2_explanation_generation.py --dataset_name LIAR-RAW_step2 --output_dir ./sdrive/MyDrive/thesis/datasets/LIAR-RAW_step2 --generate_explanation_gpt 
