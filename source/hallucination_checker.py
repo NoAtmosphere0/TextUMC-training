@@ -11,9 +11,7 @@ Output: Boolean value indicating whether the model has hallucinated or not.
 - If False, the synthesizer will return the response as it is.
 ----- 
 
-In this module, we use the Phi-3.5-mini-instruct model from Microsoft as the base model
-
-The adapter model is the Phi-3.5-hallucination-judge model from grounded-ai
+In this module, we use the vectara/hallucination_evaluation_model
 
 The HallucinationChecker class is used to check if a model has hallucinated or not.
 
@@ -23,10 +21,6 @@ A hallucination occurs when the response is coherent but factually incorrect or 
 from peft import PeftModel, PeftConfig
 from transformers import AutoModelForCausalLM, pipeline, AutoTokenizer
 import torch
-
-# config = PeftConfig.from_pretrained("grounded-ai/phi3.5-hallucination-judge")
-# base_model = AutoModelForCausalLM.from_pretrained("microsoft/Phi-3.5-mini-instruct")
-# model = PeftModel.from_pretrained(base_model, "grounded-ai/phi3.5-hallucination-judge")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
