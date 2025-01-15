@@ -18,7 +18,6 @@ The HallucinationChecker class is used to check if a model has hallucinated or n
 A hallucination occurs when the response is coherent but factually incorrect or nonsensical outputs that are not grounded in the provided context.
 """
 
-from peft import PeftModel, PeftConfig
 from transformers import AutoModelForCausalLM, pipeline, AutoTokenizer
 import torch
 

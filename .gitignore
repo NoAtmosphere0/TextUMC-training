@@ -12,7 +12,10 @@ dataset/
 secrets/
 results/
 logs/
+outputs/
+assets/
 
+Unsupervised Multimodal Clustering for Semantics Discovery in Multimodal Utterances.pdf
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
