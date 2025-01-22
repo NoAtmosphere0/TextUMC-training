@@ -1,46 +1,34 @@
 # Thesis-test-code
 
-## Some diagrams
-- Pipeline
-```mermaid
-flowchart LR
-    Input@{ shape: lean-r, label: "A cluster of similar reports" }--> Synthesizer
-    Synthesizer --> output@{ shape: lean-r, label: "Synthesized segments" }
-    output -->|Compare with golden explanations| similarity_score[Similarity Score]
-    output -->  hallu_check@{ shape: diamond, label: "Hallucination Checker" }
-    similarity_score -. Feedback .-> Synthesizer
-    hallu_check -->|Pass| LLM[Language Model]
-    hallu_check -->|Fail| Synthesizer
-    LLM --> label([Label])
-    label -. Feedback .-> Synthesizer
+## Installation
+
+```bash
+# Clone repository
+git clone https://github.com/yourusername/thesis-test-code.git
+cd thesis-test-code
+
+# Create virtual environment with micromamba (recommended)
+micromamba create -n venv python==3.12.8
+micromamba activate venv
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
 ```
 
-- Class diagram
-```mermaid
----
-title: Class diagram
----
-classDiagram
-    class Synthesizer {
-        +__init__(agent, reward_calculator, llm)
-        +train()
-        +evaluate()
-
-    }
-
-    class FixedLLM {
-        +evaluate_credibility(segments)
-    }
-    class RewardCalculator {
-        +calculate_reward(selected_segments, golden_explanations, credibility_label)
-    }
-    class ReinforcementLearningAgent {
-        +select_segments(reports)
-        +update_policy(reward)
-    }
-    
-    %% DataProcessor <|-- Synthesizer
-    %% FixedLLM <|-- Synthesizer
-    %% RewardCalculator <|-- Synthesizer
-    %% ReinforcementLearningAgent <|-- Synthesizer
+# Install dependencies
+```bash
+pip install -r requirements.txt
 ```
+
+## Usage
+- Normal (unified) training mode
+```bash
+python model2.py --train_type normal --num_epochs 10  # currently batch size is fixed at -1 for normal training
+```
+
+- Per-claim (demonic) training mode
+```bash
+python model2.py --train_type demonic --num_epochs 5 --batch_size 32 # dunno if batch_size works now
+```
+

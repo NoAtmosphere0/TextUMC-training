@@ -1,3 +1,7 @@
+""" TextUMC model for unsupervised text clustering """
+
+# TODO: Refactor code, split into files, add type hints, add docstrings, add logging, add rich output
+
 import torch
 import torch.nn as nn
 from transformers import BertModel, BertTokenizer
@@ -6,7 +10,7 @@ import numpy as np
 from torch.nn import functional as F
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple
-from tqdm import tqdm
+from tqdm import tqdm, trange
 import logging
 import torch.cuda
 from torch.utils.data import DataLoader, Dataset
@@ -21,6 +25,13 @@ from datetime import datetime
 from typing import Any
 
 # Add imports at top
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    BarColumn,
+    TimeElapsedColumn,
+)
 from rich.console import Console
 from rich.traceback import install
 from rich.logging import RichHandler
@@ -29,6 +40,9 @@ from rich.table import Table
 from rich import print as rprint
 import sys
 from sklearn.manifold import TSNE
+from sklearn.neighbors import NearestNeighbors
+
+from cluster_evaluator import ClusteringEvaluator
 
 # Install rich traceback
 install(show_locals=False)
@@ -40,6 +54,10 @@ logging.basicConfig(
     format="%(message)s",
     handlers=[RichHandler(console=console, rich_tracebacks=True)],
 )
+
+import warnings
+
+warnings.filterwarnings("ignore")
 
 
 @dataclass
@@ -151,7 +169,7 @@ class TextUMC(nn.Module):
 
         # Check for NaN values
         if torch.isnan(x).any():
-            raise ValueError("NaN values detected in embeddings")
+            x = torch.nan_to_num(x, nan=0.0)
 
         return x
 
@@ -165,6 +183,14 @@ class TextUMC(nn.Module):
         z2 = self.dropout2(z_t)
 
         return z1, z2
+
+    def save_model(self, path: str):
+        """Save model to disk"""
+        torch.save(self.state_dict(), path)
+
+    def load_model(self, path: str):
+        """Load model from disk"""
+        self.load_state_dict(torch.load(path))
 
 
 def unsupervised_contrastive_loss(embeddings, temp=0.07):
@@ -213,6 +239,8 @@ def supervised_contrastive_loss(embeddings, labels, temp=0.07):
     norm_emb = F.normalize(embeddings, dim=1)
 
     # Create label mask
+    # Convert to tensor
+    labels = torch.tensor(labels, device=device)
     labels = labels.contiguous().view(-1, 1)
     mask = torch.eq(labels, labels.T).float()
 
@@ -252,32 +280,46 @@ def calculate_densities_and_optimal_knear(
     interval=0.02,
     device="cpu",
 ):
-    """Enhanced density calculation with optimal k-near selection"""
-    num_embeddings = len(embeddings)
+    """Enhanced density calculation with optimal k-near selection using reachability distance.
 
-    # Generate k-near candidates adaptively
+    Args:
+        embeddings: Tensor of shape (n_samples, n_features)
+        cluster_indices: Array of current cluster assignments
+        num_candidates: Number of k-nearest neighbor candidates to try
+        lower_bound: Minimum proportion of points to consider as neighbors
+        interval: Step size for generating k-near candidates
+        device: Device to perform calculations on
+
+    Returns:
+        tuple: (final_densities, optimal_knear)
+    """
+    num_embeddings = len(embeddings)
+    embeddings_np = embeddings.detach().cpu().numpy()
+
+    # Generate k-near candidates as proportions of total points
+    k_candidate_proportions = np.arange(
+        lower_bound, lower_bound + interval * num_candidates, interval
+    )
     k_near_candidates = [
-        max(1, math.floor(num_embeddings * (lower_bound + interval * q)))
-        for q in range(num_candidates)
+        max(1, int(len(embeddings_np) * k)) for k in k_candidate_proportions
     ]
     k_near_candidates = sorted(set(k_near_candidates))
-
-    # Calculate pairwise distances once
-    distances = pairwise_distances(embeddings.detach().cpu().numpy())
 
     best_score = float("-inf")
     optimal_knear = k_near_candidates[0]
     final_densities = None
 
-    # Find optimal k-near
+    # Find optimal k-near using reachability distance
     for k_near in k_near_candidates:
-        densities = []
-        for i in range(num_embeddings):
-            # Get k nearest neighbors
-            nn_indices = np.argsort(distances[i])[1 : k_near + 1]
-            avg_dist = np.mean(distances[i, nn_indices])
-            density = 1 / (avg_dist + 1e-8)  # Avoid division by zero
-            densities.append(density)
+        # Use NearestNeighbors for efficient neighbor computation
+        nbrs = NearestNeighbors(n_neighbors=k_near + 1, algorithm="auto").fit(
+            embeddings_np
+        )
+        distances, indices = nbrs.kneighbors(embeddings_np)
+
+        # Calculate reachability-based density
+        reachable_distances = np.mean(distances[:, 1:], axis=1)  # Exclude self
+        densities = 1 / (reachable_distances + 1e-8)  # Avoid division by zero
 
         # Calculate cluster cohesion score
         cohesion_score = calculate_cluster_cohesion(
@@ -287,40 +329,49 @@ def calculate_densities_and_optimal_knear(
         if cohesion_score > best_score:
             best_score = cohesion_score
             optimal_knear = k_near
-            final_densities = np.array(densities)
+            final_densities = densities
 
-    return final_densities, optimal_knear
+    return np.array(final_densities), optimal_knear
 
 
 def select_diverse_samples(embeddings, densities, optimal_knear, num_samples):
     """Select diverse high-density samples"""
     selected = []
     remaining = list(range(len(embeddings)))
-    distances = pairwise_distances(embeddings.detach().cpu().numpy())
+    distances = pairwise_distances(embeddings)
 
     # Select first sample with highest density
-    first_idx = remaining[np.argmax(densities)]
+    first_idx = np.argmax(densities)
     selected.append(first_idx)
     remaining.remove(first_idx)
 
-    # Select remaining samples
-    while len(selected) < num_samples:
-        max_min_dist = float("-inf")
-        next_idx = None
+    # Iteratively select samples that maximize density and diversity
+    while len(selected) < num_samples and remaining:
+        max_score = float("-inf")
+        best_idx = None
 
-        # Find point with maximum minimum distance to selected points
+        # Calculate scores for remaining samples
         for idx in remaining:
-            min_dist = min(distances[idx][selected])
-            if min_dist > max_min_dist and densities[idx] > np.median(densities):
-                max_min_dist = min_dist
-                next_idx = idx
+            # Density component
+            density_score = densities[idx]
 
-        if next_idx is None:
+            # Diversity component - minimum distance to already selected samples
+            diversity_score = min(distances[idx][j] for j in selected)
+
+            # Combined score with density and diversity
+            score = density_score * diversity_score
+
+            if score > max_score:
+                max_score = score
+                best_idx = idx
+
+        if best_idx is not None:
+            selected.append(best_idx)
+            remaining.remove(best_idx)
+        else:
             break
-        selected.append(next_idx)
-        remaining.remove(next_idx)
 
-    return selected
+    return np.array(selected)
 
 
 def cluster_and_select_samples(embeddings, num_clusters, t, current_centroids, device):
@@ -336,19 +387,52 @@ def cluster_and_select_samples(embeddings, num_clusters, t, current_centroids, d
         logging.warning("Cleaning NaN values before clustering")
         embeddings_np = np.nan_to_num(embeddings_np, 0)
 
-    kmeans = KMeans(
-        n_clusters=num_clusters,
-        init=current_centroids if current_centroids is not None else "k-means++",
-        n_init=5,
-        max_iter=200,
+    cluster_indices = np.zeros(len(embeddings_np))
+
+    # Calculate densities and optimal k-near
+    densities, optimal_knear = calculate_densities_and_optimal_knear(
+        embeddings=embeddings,
+        cluster_indices=cluster_indices,
+        num_candidates=10,
+        lower_bound=0.1,
+        interval=0.02,
+        device=device,
     )
 
-    kmeans.fit(embeddings_np)
-    return (
-        kmeans.labels_,
-        torch.tensor(kmeans.labels_).to(device),
-        kmeans.cluster_centers_,
+    # Select diverse samples
+    selected_indices = select_diverse_samples(
+        embeddings=embeddings_np,
+        densities=densities,
+        optimal_knear=optimal_knear,
+        num_samples=num_clusters,
     )
+
+    # Update cluster indices
+    for idx in selected_indices:
+        cluster_indices[idx] = 1  # Mark as selected
+
+    if optimal_knear <= len(embeddings_np):
+        # Use selected samples as initial centroids
+        initial_centroids = embeddings_np[selected_indices]
+    else:
+        # Fallback to existing centroids or k-means++
+        initial_centroids = (
+            current_centroids if current_centroids is not None else "k-means++"
+        )
+
+    # Perform KMeans clustering
+    kmeans = KMeans(
+        n_clusters=num_clusters,
+        init=initial_centroids,
+        n_init=1,
+        max_iter=200,
+        random_state=42,  # Add for reproducibility
+    )
+
+    # Fit KMeans
+    cluster_labels = kmeans.fit_predict(embeddings_np)
+
+    return cluster_labels, cluster_indices, kmeans.cluster_centers_
 
 
 def calculate_cluster_cohesion(embeddings, densities, k_near, cluster_indices, device):
@@ -366,23 +450,33 @@ def calculate_cluster_cohesion(embeddings, densities, k_near, cluster_indices, d
     """
     num_embeddings = len(embeddings)
     if num_embeddings <= 1:
-        return 0  # handle the cases where the cluster has only one or no embedding.
+        return 0.0
 
-    distances = pairwise_distances(embeddings.detach().cpu().numpy())
-    total_cohesion = 0
+    # Convert embeddings to numpy if needed
+    if torch.is_tensor(embeddings):
+        embeddings = embeddings.detach().cpu().numpy()
 
-    for i in range(num_embeddings):
-        nearest_neighbors_indices = np.argsort(distances[i])[
-            1 : k_near + 1
-        ]  # Exclude self, take top k
+    # Calculate pairwise distances
+    distances = pairwise_distances(embeddings)
 
-        if nearest_neighbors_indices.size == 0:
-            continue  # Handles the case where there is no neighbors
+    # Get k nearest neighbors for each point
+    k = min(k_near, num_embeddings - 1)
+    nearest_distances = np.partition(distances, k, axis=1)[:, :k]
 
-        total_cohesion += np.mean(distances[i, nearest_neighbors_indices])
+    # Weight distances by density
+    density_weights = densities.reshape(-1, 1)
+    weighted_distances = nearest_distances * density_weights
 
-    cohesion_score = total_cohesion / num_embeddings if num_embeddings > 0 else 0
-    return -cohesion_score  # Return negative to maximize through argmax
+    # Calculate cohesion score
+    cohesion = -np.mean(weighted_distances)
+
+    # Normalize by cluster size
+    cohesion = cohesion / (num_embeddings + 1e-8)
+
+    return float(cohesion)
+
+
+from rich.progress import Task
 
 
 def umc_train(
@@ -391,7 +485,7 @@ def umc_train(
     num_clusters: int = 10,
     batch_size: int = 32,
     learning_rate: float = 0.001,
-    num_epochs: int = 100,
+    num_epochs: int = 5,
     temp_1: float = 0.2,  # Temperature for unsupervised loss
     temp_2: float = 0.2,  # Temperature for supervised loss
 ) -> Tuple[List[Evidence], dict]:
@@ -416,56 +510,66 @@ def umc_train(
 
     # Training loop
     try:
-        for epoch in track(range(num_epochs), description="Training"):
+        for epoch in trange(num_epochs, desc="Training", unit="epoch"):
             epoch_loss = 0
-            for i in range(0, len(evidence_texts), batch_size):
-                batch_texts = evidence_texts[i : i + batch_size]
-                embeddings = model(batch_texts)
 
-                # Get augmented views
-                z1, z2 = model.augment_views(embeddings)
-                aug_embeddings = torch.cat([z1, z2], dim=0)
+            batch_texts = evidence_texts
+            print("Batch Texts")
+            embeddings = model(batch_texts)
+            print("Embeddings")
+            # Get augmented views
+            z1, z2 = model.augment_views(embeddings)
+            aug_embeddings = torch.cat([z1, z2], dim=0)
 
-                # Unsupervised contrastive loss
-                unsup_loss = unsupervised_contrastive_loss(aug_embeddings, temp=temp_1)
+            # Unsupervised contrastive loss1
+            unsup_loss = unsupervised_contrastive_loss(aug_embeddings, temp=temp_1)
 
-                # Get cluster assignments for supervised loss
-                _, pseudo_labels, current_centroids = cluster_and_select_samples(
-                    embeddings, num_clusters, 0.5, current_centroids, model.device
-                )
+            # Get cluster assignments for supervised loss
+            _, pseudo_labels, current_centroids = cluster_and_select_samples(
+                embeddings, num_clusters, 0.5, current_centroids, model.device
+            )
 
-                # Supervised contrastive loss with pseudo-labels
-                sup_loss = supervised_contrastive_loss(
-                    embeddings, pseudo_labels, temp=temp_2
-                )
+            # Supervised contrastive loss with pseudo-labels
+            sup_loss = supervised_contrastive_loss(
+                embeddings, pseudo_labels, temp=temp_2
+            )
 
-                # Combine losses
-                loss = unsup_loss + sup_loss
+            # Combine losses
+            loss = unsup_loss + sup_loss
 
-                model.optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                model.optimizer.step()
+            model.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            model.optimizer.step()
 
-                epoch_loss += loss.item()
+            epoch_loss += loss.item()
 
-                # Add NaN checks
-                if torch.isnan(embeddings).any():
-                    raise ValueError("NaN embeddings detected")
+            # Add NaN checks
+            if torch.isnan(embeddings).any():
+                raise ValueError("NaN embeddings detected")
 
-                metrics["unsup_losses"].append(unsup_loss.item())
-                metrics["sup_losses"].append(sup_loss.item())
+            metrics["unsup_losses"].append(unsup_loss.item())
+            metrics["sup_losses"].append(sup_loss.item())
 
             avg_loss = epoch_loss / (len(evidence_texts) / batch_size)
             metrics["epoch_losses"].append(avg_loss)
 
             # Add debug info
-            if epoch % 10 == 0:
-                logging.info(f"Epoch {epoch} loss: {avg_loss:.4f}")
+            # if epoch % 10 == 0:
+            #     logging.info(f"Epoch {epoch} loss: {avg_loss:.4f}")
+
+            # Update progress if provided
+            # if progress is not None and train_task is not None:
+            #     completed = int((epoch + 1) / num_epochs * 100)
+            #     progress.update(train_task, completed=completed)
 
     except Exception as e:
         logging.error(f"Training failed: {str(e)}")
         raise
+
+    # Final progress update
+    # if train_task is not None:
+    #     progress.update(train_task, completed=100)
 
     return evidences, metrics
 
@@ -518,7 +622,7 @@ def visualize_clusters(
     pca_embeddings = pca.fit_transform(embeddings)
 
     # t-SNE reduction
-    tsne = TSNE(n_components=2, perplexity=10, max_iter=1000)
+    tsne = TSNE(n_components=2, perplexity=5, max_iter=1000)
     tsne_embeddings = tsne.fit_transform(embeddings)
 
     # Plot PCA
@@ -579,109 +683,183 @@ def print_evidence_clusters(claim: Claim, cluster_labels: np.ndarray):
     console.print(table)
 
 
-def main():
-    """Main function to run full text clustering pipeline"""
-    # Setup output directory
-    output_dir = "outputs"
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(output_dir, run_id)
-    os.makedirs(run_dir, exist_ok=True)
+# def main():
+#     """Main function to run full text clustering pipeline"""
+#     # Setup output directory
+#     output_dir = "outputs"
+#     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+#     run_dir = os.path.join(output_dir, run_id)
+#     os.makedirs(run_dir, exist_ok=True)
 
-    try:
-        # Load example data
-        example_data = json.load(open("dataset/LIAR-RAW/test.json"))[403]
-        example_claim = Claim(
-            claim_id="403",
-            content=example_data["claim"],
-            label=example_data["label"],
-            explanation=example_data["explain"],
-        )
+#     try:
+#         # Load example data
+#         # data = json.load(open("dataset/LIAR-RAW/test.json"))
 
-        # Load evidences
-        for evidence in example_data["reports"]:
-            example_claim.evidences.append(
-                Evidence(evidence_id=evidence["report_id"], content=evidence["content"])
-            )
+#         # Get 403rd claim
+#         example_data = json.load(open("dataset/LIAR-RAW/test.json"))[403]
 
-        print(f"Claim: {example_claim.content}")
-        print(f"Number of evidences: {len(example_claim.evidences)}")
+#         example_claim = Claim(
+#             claim_id="403",
+#             content=example_data["claim"],
+#             label=example_data["label"],
+#             explanation=example_data["explain"],
+#         )
 
-        # Initialize model
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = TextUMC().to(device)
+#         # Load evidences
+#         for evidence in example_data["reports"]:
+#             example_claim.evidences.append(
+#                 Evidence(evidence_id=evidence["report_id"], content=evidence["content"])
+#             )
+#         # print(f"Number of claims: {len(data)}")
 
-        # Train model
-        trained_evidences, metrics = umc_train(
-            model=model,
-            evidences=example_claim.evidences,
-            num_clusters=min(len(example_claim.evidences), 5),
-            batch_size=32,
-            num_epochs=200,
-            learning_rate=2e-5,
-        )
+#         # Initialize clustering evaluator
+#         evaluator = ClusteringEvaluator()
 
-        # Get evidence embeddings
-        evidence_texts = [ev.content for ev in example_claim.evidences]
-        with torch.no_grad():
-            evidence_embeddings = model(evidence_texts)
-            evidence_embeddings_np = evidence_embeddings.cpu().numpy()
+#         with Progress(
+#             SpinnerColumn(),
+#             TextColumn("[progress.description]{task.description}"),
+#             BarColumn(),
+#             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+#             TimeElapsedColumn(),
+#         ) as progress:
+#             # Create the main claims progress bar
+#             claims_task = progress.add_task(
+#                 "[cyan]Processing Claims...", total=len(data)
+#             )
 
-        print(f"Evidence Embeddings: {evidence_embeddings_np.shape}")
+#             for idx, claim_data in enumerate(data):
+#                 # Create a task for the training epochs
+#                 training_task = progress.add_task(
+#                     f"[green]Training Claim {idx}", total=100
+#                 )
 
-        # Cluster evidences
-        n_clusters = min(len(evidence_texts), 5)
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-        cluster_labels = kmeans.fit_predict(evidence_embeddings_np)
+#                 if len(claim_data["reports"]) < 5:
+#                     continue
 
-        # Print clusters
-        print_evidence_clusters(example_claim, cluster_labels)
+#                 claim = Claim(
+#                     claim_id=str(idx),
+#                     content=claim_data["claim"],
+#                     label=claim_data["label"],
+#                     explanation=claim_data["explain"],
+#                 )
 
-        # Group evidences
-        example_claim.clustered_evidences = {
-            i: [
-                ev
-                for ev, label in zip(example_claim.evidences, cluster_labels)
-                if label == i
-            ]
-            for i in range(n_clusters)
-        }
+#                 # Load evidences
+#                 for evidence in claim_data["reports"]:
+#                     claim.evidences.append(
+#                         Evidence(
+#                             evidence_id=evidence["report_id"],
+#                             content=evidence["content"],
+#                         )
+#                     )
 
-        # Visualize clusters
-        plot_path = os.path.join(run_dir, "evidence_clusters.png")
-        visualize_clusters(
-            evidence_embeddings_np,
-            cluster_labels,
-            f"Evidence Clusters for Claim {example_claim.claim_id}",
-            plot_path,
-        )
+#         # Clear GPU cache and initialize model
+#         torch.cuda.empty_cache()
 
-        # Save results
-        results = {
-            "claim": {
-                "claim_id": example_claim.claim_id,
-                "content": example_claim.content,
-                "label": example_claim.label,
-                "explanation": example_claim.explanation,
-                "clustered_evidences": {
-                    str(key): [
-                        {"evidence_id": ev.evidence_id, "content": ev.content}
-                        for ev in value
-                    ]
-                    for key, value in example_claim.clustered_evidences.items()
-                },
-            },
-            "training_metrics": metrics,
-        }
+#         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#         model = TextUMC().to(device)
 
-        with open(os.path.join(run_dir, "results.json"), "w") as f:
-            json.dump(results, f, indent=4)
+#         # Train model
+#         _, metrics = umc_train(
+#             model=model,
+#             evidences=claim.evidences,
+#             num_clusters=min(len(claim.evidences), 5),
+#             batch_size=32,
+#             num_epochs=100,
+#             learning_rate=2e-5,
+#             progress=progress,
+#             train_task=training_task,
+#         )
 
-        logging.info(f"Results saved in {run_dir}")
+#         # Remove the training task when done
+#         progress.remove_task(training_task)
 
-    except Exception as e:
-        logging.error(f"Pipeline failed: {str(e)}", exc_info=True)
-        raise
+#         # Get evidence embeddings
+#         evidence_texts = [ev.content for ev in claim.evidences]
+#         with torch.no_grad():
+#             evidence_embeddings = model(evidence_texts)
+#             evidence_embeddings_np = evidence_embeddings.cpu().numpy()
+
+#         # Save embeddings into evidence objects
+#         for ev, emb in zip(claim.evidences, evidence_embeddings_np):
+#             ev.embedding = emb
+
+#         # print(f"Number of Evidence(s): {evidence_embeddings_np.shape}")
+
+#         # Cluster evidences
+#         n_clusters = min(len(evidence_texts), 5)
+#         kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+#         cluster_labels = kmeans.fit_predict(evidence_embeddings_np)
+
+#         metrics = evaluator.evaluate_claim(
+#             claim_id=claim.claim_id,
+#             embeddings=evidence_embeddings,
+#             cluster_labels=cluster_labels,
+#         )
+
+#         # Update the main claims progress
+#         progress.update(claims_task, advance=1)
+
+#         # -------------------------------------------------------------------------
+#         # Print clusters
+#         print_evidence_clusters(claim, cluster_labels)
+
+#         # -------------------------------------------------------------------------
+#         # Calculate clustering metrics
+#         # Group evidences
+#         claim.clustered_evidences = {
+#             i: [ev for ev, label in zip(claim.evidences, cluster_labels) if label == i]
+#             for i in range(n_clusters)
+#         }
+
+#         # Visualize clusters
+#         plot_path = os.path.join(run_dir, "evidence_clusters.png")
+#         visualize_clusters(
+#             evidence_embeddings_np,
+#             cluster_labels,
+#             f"Evidence Clusters for Claim {example_claim.claim_id}",
+#             plot_path,
+#         )
+
+#         # Save results
+#         results = {
+#             "claim": {
+#                 "claim_id": claim.claim_id,
+#                 "content": claim.content,
+#                 "label": claim.label,
+#                 "explanation": claim.explanation,
+#                 "clustered_evidences": {
+#                     str(key): [
+#                         {"evidence_id": ev.evidence_id, "content": ev.content}
+#                         for ev in value
+#                     ]
+#                     for key, value in claim.clustered_evidences.items()
+#                 },
+#             },
+#             "training_metrics": metrics,
+#         }
+#         # -------------------------------------------------------------------------
+
+#         with open(os.path.join(run_dir, "results.json"), "w") as f:
+#             json.dump(results, f, indent=4)
+
+#         logging.info(f"Results saved in {run_dir}")
+
+#         # Get aggregate metrics
+#         aggregate_metrics = evaluator.get_aggregate_metrics()
+
+#         # Get detailed report for all claims
+#         detailed_report = evaluator.get_detailed_report()
+
+#         # Save all results
+#         evaluator.save_results(
+#             output_path="./clustering_results",
+#             experiment_name="umc_clustering_evaluation",
+#         )
+
+#     except Exception as e:
+#         logging.error(f"Pipeline failed: {str(e)}", exc_info=True)
+#         raise
 
 
-if __name__ == "__main__":
-    main()
+# if __name__ == "__main__":
+#     main()
