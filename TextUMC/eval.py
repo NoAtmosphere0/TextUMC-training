@@ -1,5 +1,7 @@
 """Evaluation script for TextUMC model"""
 
+import colab
+
 from model import (
     TextUMC,
     Claim,

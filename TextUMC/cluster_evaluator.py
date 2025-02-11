@@ -15,11 +15,22 @@ class ClusteringMetrics:
     """Store clustering metrics for a single claim"""
 
     claim_id: str
-    n_samples: int  # number of evidences
-    n_clusters: int
-    silhouette: float
-    calinski_harabasz: float
-    davies_bouldin: float
+    n_samples: int
+
+    # Silhouette score metrics
+    silhouette_score: float
+    silhouette_n_clusters: int
+    silhouette_labels: np.ndarray
+
+    # Calinski-Harabasz metrics
+    calinski_score: float
+    calinski_n_clusters: int
+    calinski_labels: np.ndarray
+
+    # Davies-Bouldin metrics
+    davies_score: float
+    davies_n_clusters: int
+    davies_labels: np.ndarray
 
 
 class ClusteringEvaluator:
@@ -27,90 +38,46 @@ class ClusteringEvaluator:
         self.metrics: List[ClusteringMetrics] = []
 
     def evaluate_claim(
-        self, claim_id: str, embeddings: torch.Tensor, cluster_labels: torch.Tensor
+        self, claim_id: str, embeddings: torch.Tensor, optimal_configs: Dict[str, Dict]
     ) -> ClusteringMetrics:
-        """
-        Calculate clustering metrics for a single claim's embeddings
-
-        Args:
-            claim_id: Unique identifier for the claim
-            embeddings: Tensor of shape (n_samples, n_features)
-            cluster_labels: Tensor of shape (n_samples,) containing cluster assignments
-        """
-        # Convert tensors to numpy arrays if needed
+        """Calculate clustering metrics for a single claim's embeddings"""
         if isinstance(embeddings, torch.Tensor):
             embeddings = embeddings.cpu().numpy()
-        if isinstance(cluster_labels, torch.Tensor):
-            cluster_labels = cluster_labels.cpu().numpy()
 
-        # Skip evaluation if there are too few samples
-        if len(embeddings) < 2 or len(np.unique(cluster_labels)) < 2:
-            print(f"Skipping claim {claim_id} due to insufficient samples or clusters.")
-            return ClusteringMetrics(
-                claim_id=claim_id,
-                n_samples=len(embeddings),
-                n_clusters=len(np.unique(cluster_labels)),
-                silhouette=np.nan,
-                calinski_harabasz=np.nan,
-                davies_bouldin=np.nan,
-            )
-
-        # Calculate metrics
         metrics = ClusteringMetrics(
             claim_id=claim_id,
             n_samples=len(embeddings),
-            n_clusters=len(np.unique(cluster_labels)),
-            silhouette=silhouette_score(embeddings, cluster_labels),
-            calinski_harabasz=calinski_harabasz_score(embeddings, cluster_labels),
-            davies_bouldin=davies_bouldin_score(embeddings, cluster_labels),
+            silhouette_score=optimal_configs["silhouette"]["score"],
+            silhouette_n_clusters=optimal_configs["silhouette"]["n_clusters"],
+            silhouette_labels=optimal_configs["silhouette"]["labels"],
+            calinski_score=optimal_configs["calinski"]["score"],
+            calinski_n_clusters=optimal_configs["calinski"]["n_clusters"],
+            calinski_labels=optimal_configs["calinski"]["labels"],
+            davies_score=optimal_configs["davies"]["score"],
+            davies_n_clusters=optimal_configs["davies"]["n_clusters"],
+            davies_labels=optimal_configs["davies"]["labels"],
         )
 
         self.metrics.append(metrics)
         return metrics
 
     def get_aggregate_metrics(self) -> Dict[str, float]:
-        """
-        Calculate aggregate statistics across all processed claims
-
-        Returns dictionary with various aggregate metrics and their values
-        """
+        """Calculate aggregate statistics across all processed claims"""
         if not self.metrics:
             return {}
 
-        # Convert to DataFrame for easier analysis
         df = pd.DataFrame([vars(m) for m in self.metrics])
 
-        # Calculate weighted averages based on number of samples
         metrics = {
-            "silhouette_avg": np.average(
-                df["silhouette"],
-                # weights=df["n_samples"],
-                # where=~np.isnan(df["silhouette"]),
-            ),
-            "calinski_harabasz_avg": np.average(
-                df["calinski_harabasz"],
-                # weights=df["n_samples"],
-                # where=~np.isnan(df["calinski_harabasz"]),
-            ),
-            "davies_bouldin_avg": np.average(
-                df["davies_bouldin"],
-                # weights=df["n_samples"],
-                # where=~np.isnan(df["davies_bouldin"]),
-            ),
+            "silhouette_score_avg": df["silhouette_score"].mean(),
+            "silhouette_n_clusters_avg": df["silhouette_n_clusters"].mean(),
+            "calinski_score_avg": df["calinski_score"].mean(),
+            "calinski_n_clusters_avg": df["calinski_n_clusters"].mean(),
+            "davies_score_avg": df["davies_score"].mean(),
+            "davies_n_clusters_avg": df["davies_n_clusters"].mean(),
         }
 
-        # Calculate additional statistics
-        basic_stats = {
-            "total_claims": len(df),
-            "total_samples": df["n_samples"].sum(),
-            "avg_samples_per_claim": df["n_samples"].mean(),
-            "avg_clusters_per_claim": df["n_clusters"].mean(),
-            "silhouette_std": df["silhouette"].std(),
-            "calinski_harabasz_std": df["calinski_harabasz"].std(),
-            "davies_bouldin_std": df["davies_bouldin"].std(),
-        }
-
-        return {**metrics, **basic_stats}
+        return metrics
 
     def get_detailed_report(self) -> pd.DataFrame:
         """

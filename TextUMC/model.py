@@ -13,6 +13,7 @@ from typing import List, Optional, Dict, Tuple
 from tqdm import tqdm, trange
 import logging
 import torch.cuda
+from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader, Dataset
 import json
 import matplotlib.pyplot as plt
@@ -99,41 +100,65 @@ class TextDataset(Dataset):
         return self.texts[idx]
 
 
+@dataclass
+class ModelConfig:
+    """Configuration for TextUMC model."""
+
+    bert_model_name: str = "bert-large-uncased"
+    embedding_dim: int = 1024
+    hidden_dim: int = 512
+    reduced_dim: int = 256
+    dropout_rate: float = 0.2
+    temperature: float = 0.07
+
+
 class TextUMC(nn.Module):
-    def __init__(
-        self,
-        bert_model_name="bert-base-uncased",
-        embedding_dim=768,
-        hidden_dim=256,
-        reduced_dim=128,
-    ):
-        super(TextUMC, self).__init__()
+    """Text Unsupervised Multi-view Clustering model."""
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # BERT components
-        self.tokenizer = BertTokenizer.from_pretrained(bert_model_name)
-        self.bert_encoder = BertModel.from_pretrained(bert_model_name)
+        # Initialize BERT components
+        self._init_bert()
 
-        # Dimensions
-        self.embedding_dim = embedding_dim
-        self.hidden_dim = hidden_dim
-        self.reduced_dim = reduced_dim
+        # Initialize projection layers
+        self._init_layers()
 
-        # Layers
-        self.projection = nn.Linear(self.embedding_dim, self.hidden_dim)
-        self.reduction = nn.Linear(self.hidden_dim, self.reduced_dim)
-
-        # Augmentation layers
-        self.dropout1 = nn.Dropout(p=0.3)
-        self.dropout2 = nn.Dropout(p=0.3)
-
-        # Memory optimization
-        self.bert_encoder.config.gradient_checkpointing = True
-        torch.backends.cudnn.benchmark = True
-        self.optimizer = None
-        self.console = Console()
+        # Optimize memory usage
+        self._optimize_memory()
 
         self.to(self.device)
+
+        self.optimizer = None
+
+    def _init_bert(self):
+        """Initialize BERT encoder and tokenizer."""
+        self.tokenizer = BertTokenizer.from_pretrained(self.config.bert_model_name)
+        self.bert_encoder = BertModel.from_pretrained(self.config.bert_model_name)
+
+    def _init_layers(self):
+        """Initialize projection and augmentation layers."""
+        self.projection = nn.Sequential(
+            nn.Linear(self.config.embedding_dim, self.config.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.config.hidden_dim, self.config.reduced_dim),
+        )
+
+        self.dropout1 = nn.Dropout(p=self.config.dropout_rate)
+        self.dropout2 = nn.Dropout(p=self.config.dropout_rate)
+
+        self.reduction = nn.Sequential(
+            nn.Linear(self.config.reduced_dim, self.config.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.config.hidden_dim, self.config.reduced_dim),
+        )
+
+    def _optimize_memory(self):
+        """Apply memory optimization settings."""
+        self.bert_encoder.config.gradient_checkpointing = True
+        torch.backends.cudnn.benchmark = True
 
     def debug_tensor(self, tensor: torch.Tensor, name: str):
         """Debug tensor properties"""
@@ -165,7 +190,8 @@ class TextUMC(nn.Module):
         # Project through MLP
         x = self.projection(embeddings)
         x = F.relu(x)
-        x = self.reduction(x)
+        # x = self.reduction(x)
+        x = F.normalize(x, dim=1)
 
         # Check for NaN values
         if torch.isnan(x).any():
@@ -422,7 +448,11 @@ def cluster_and_select_samples(embeddings, num_clusters, t, current_centroids, d
 
     # Perform KMeans clustering
     kmeans = KMeans(
-        n_clusters=num_clusters,
+        n_clusters=(
+            len(initial_centroids)
+            if optimal_knear > len(embeddings_np)
+            else num_clusters
+        ),
         init=initial_centroids,
         n_init=1,
         max_iter=200,
@@ -476,20 +506,38 @@ def calculate_cluster_cohesion(embeddings, densities, k_near, cluster_indices, d
     return float(cohesion)
 
 
-from rich.progress import Task
-
-
 def umc_train(
     model,
     evidences: List[Evidence],
-    num_clusters: int = 10,
+    num_clusters: int = 3,
     batch_size: int = 32,
     learning_rate: float = 0.001,
-    num_epochs: int = 5,
-    temp_1: float = 0.2,  # Temperature for unsupervised loss
-    temp_2: float = 0.2,  # Temperature for supervised loss
+    num_epochs: float = 5.0,
+    temp_1: float = 0.2,
+    temp_2: float = 0.2,
+    log_dir: Optional[str] = None,
+    save_after_n_epochs: int = 0,  # Add this parameter
 ) -> Tuple[List[Evidence], dict]:
-    """Train model on evidence texts using combined UMC loss"""
+    """Train model on evidence texts using combined UMC loss with batch processing
+
+    Args:
+        model (TextUMC): TextUMC model instance
+        evidences (List[Evidence]): List of evidence objects
+        num_clusters (int): Number of clusters to form
+        batch_size (int): Batch size for training
+        learning_rate (float): Learning rate for optimizer
+        num_epochs (float): Number of training epochs
+        temp_1 (float): Temperature for unsupervised loss
+        temp_2 (float): Temperature for supervised loss
+
+    Returns:
+        Tuple[List[Evidence], dict]: Tuple containing updated evidences and training metrics
+    """
+
+    writer = None
+    if log_dir:
+        writer = SummaryWriter(log_dir)
+
     # Get evidence texts
     evidence_texts = [ev.content for ev in evidences]
 
@@ -505,71 +553,171 @@ def umc_train(
     if model.optimizer is None:
         model.optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
-    metrics = {"epoch_losses": [], "unsup_losses": [], "sup_losses": []}
+    if batch_size != -1:
+        # Create data loader
+        dataset = torch.utils.data.TensorDataset(
+            torch.tensor(range(len(evidence_texts)), dtype=torch.long)
+        )
+        data_loader = torch.utils.data.DataLoader(
+            dataset, batch_size=batch_size, shuffle=True
+        )
+    else:
+        data_loader = [torch.tensor(range(len(evidence_texts)))]
+
+    metrics = {
+        "epoch_losses": [],
+        "unsup_losses": [],
+        "sup_losses": [],
+        "batch_losses": [],
+    }
     current_centroids = None
 
     # Training loop
     try:
-        for epoch in trange(num_epochs, desc="Training", unit="epoch"):
+        # Handle epochs < 1 as fraction of data_loader length
+        if num_epochs < 1:
+            total_iterations = max(1, int(num_epochs * len(data_loader)))
+        else:
+            total_iterations = int(num_epochs * len(data_loader))
+
+        iteration = 0
+        current_epoch = 0
+        last_saved_epoch = -1  # Track last epoch when model was saved
+
+        progress_bar = trange(total_iterations, desc="Training", unit="iteration")
+
+        while iteration < total_iterations:
             epoch_loss = 0
+            epoch_unsup_loss = 0
+            epoch_sup_loss = 0
+            num_batches = 0
 
-            batch_texts = evidence_texts
-            print("Batch Texts")
-            embeddings = model(batch_texts)
-            print("Embeddings")
-            # Get augmented views
-            z1, z2 = model.augment_views(embeddings)
-            aug_embeddings = torch.cat([z1, z2], dim=0)
+            # Re-initialize data loader for each epoch
+            if iteration % len(data_loader) == 0:
+                data_loader = torch.utils.data.DataLoader(
+                    dataset, batch_size=batch_size, shuffle=True
+                )
 
-            # Unsupervised contrastive loss1
-            unsup_loss = unsupervised_contrastive_loss(aug_embeddings, temp=temp_1)
+            for batch_idx, batch in enumerate(data_loader):
+                if iteration >= total_iterations:
+                    break
 
-            # Get cluster assignments for supervised loss
-            _, pseudo_labels, current_centroids = cluster_and_select_samples(
-                embeddings, num_clusters, 0.5, current_centroids, model.device
-            )
+                # Extract texts for this batch
+                if batch_size != -1:
+                    batch_texts = list(
+                        map(evidence_texts.__getitem__, batch[0].tolist())
+                    )
+                else:
+                    batch_texts = evidence_texts
 
-            # Supervised contrastive loss with pseudo-labels
-            sup_loss = supervised_contrastive_loss(
-                embeddings, pseudo_labels, temp=temp_2
-            )
+                # Get embeddings for the batch
+                embeddings = model(batch_texts)
 
-            # Combine losses
-            loss = unsup_loss + sup_loss
+                # Get augmented views
+                z1, z2 = model.augment_views(embeddings)
+                aug_embeddings = torch.cat([z1, z2], dim=0)
 
-            model.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            model.optimizer.step()
+                # Unsupervised contrastive loss
+                unsup_loss = unsupervised_contrastive_loss(aug_embeddings, temp=temp_1)
 
-            epoch_loss += loss.item()
+                # Get cluster assignments for supervised loss
+                _, pseudo_labels, current_centroids = cluster_and_select_samples(
+                    embeddings, num_clusters, 0.5, current_centroids, model.device
+                )
 
-            # Add NaN checks
-            if torch.isnan(embeddings).any():
-                raise ValueError("NaN embeddings detected")
+                # Supervised contrastive loss with pseudo-labels
+                sup_loss = 0
+                sup_loss = supervised_contrastive_loss(
+                    embeddings, pseudo_labels, temp=temp_2
+                )
 
-            metrics["unsup_losses"].append(unsup_loss.item())
-            metrics["sup_losses"].append(sup_loss.item())
+                # Combine losses
+                loss = unsup_loss + sup_loss
 
-            avg_loss = epoch_loss / (len(evidence_texts) / batch_size)
-            metrics["epoch_losses"].append(avg_loss)
+                # Zero gradients, backpropagate, and optimize
+                model.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                model.optimizer.step()
 
-            # Add debug info
-            # if epoch % 10 == 0:
-            #     logging.info(f"Epoch {epoch} loss: {avg_loss:.4f}")
+                # Tracking metrics
+                batch_loss = loss.item()
+                epoch_loss += batch_loss
+                epoch_unsup_loss += unsup_loss.item()
+                # epoch_sup_loss += sup_loss.item()
+                num_batches += 1
 
-            # Update progress if provided
-            # if progress is not None and train_task is not None:
-            #     completed = int((epoch + 1) / num_epochs * 100)
-            #     progress.update(train_task, completed=completed)
+                # Add NaN checks
+                if torch.isnan(embeddings).any():
+                    raise ValueError("NaN embeddings detected in batch")
+
+                metrics["batch_losses"].append(batch_loss)
+
+                iteration += 1
+                progress_bar.update(1)
+
+                # Update epoch counter
+                current_epoch = iteration / len(data_loader)
+
+                # Save model if needed
+                if save_after_n_epochs > 0:
+                    current_epoch_int = int(current_epoch)
+                    if (
+                        current_epoch_int > last_saved_epoch
+                        and current_epoch_int % save_after_n_epochs == 0
+                    ):
+                        if log_dir:
+                            model_path = os.path.join(
+                                log_dir, f"model_epoch_{current_epoch_int}.pt"
+                            )
+                            model.save_model(model_path)
+                            logging.info(f"Model saved at epoch {current_epoch_int}")
+                            last_saved_epoch = current_epoch_int
+
+                if writer:
+                    global_step = iteration
+                    writer.add_scalar("Loss/batch_total", batch_loss, global_step)
+                    writer.add_scalar(
+                        "Loss/batch_unsupervised", unsup_loss.item(), global_step
+                    )
+                    writer.add_scalar(
+                        "Loss/batch_supervised", sup_loss.item(), global_step
+                    )
+
+            # Compute and log epoch metrics only when a full epoch is completed
+            if int(current_epoch) > int(current_epoch - 1.0 / len(data_loader)):
+                avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0
+                avg_unsup_loss = (
+                    epoch_unsup_loss / num_batches if num_batches > 0 else 0
+                )
+                avg_sup_loss = epoch_sup_loss / num_batches if num_batches > 0 else 0
+
+                metrics["epoch_losses"].append(avg_epoch_loss)
+                metrics["unsup_losses"].append(avg_unsup_loss)
+                metrics["sup_losses"].append(avg_sup_loss)
+
+                if writer:
+                    writer.add_scalar(
+                        "Loss/epoch_total", avg_epoch_loss, int(current_epoch)
+                    )
+                    writer.add_scalar(
+                        "Loss/epoch_unsupervised", avg_unsup_loss, int(current_epoch)
+                    )
+                    writer.add_scalar(
+                        "Loss/epoch_supervised", avg_sup_loss, int(current_epoch)
+                    )
+
+        # Save final model
+        if log_dir:
+            final_model_path = os.path.join(log_dir, "model_final.pt")
+            model.save_model(final_model_path)
+            logging.info("Final model saved")
+
+        progress_bar.close()
 
     except Exception as e:
         logging.error(f"Training failed: {str(e)}")
         raise
-
-    # Final progress update
-    # if train_task is not None:
-    #     progress.update(train_task, completed=100)
 
     return evidences, metrics
 
@@ -585,37 +733,20 @@ def _save_embeddings(model, claims):
         claim.embedding = embedding.flatten()
 
 
-def visualize_clusters_pca(embeddings, labels, title, save_path):
-    pca = PCA(n_components=2)
-    reduced = pca.fit_transform(embeddings)
-    return plot_clusters(reduced, labels, f"{title} (PCA)", save_path)
-
-
-def visualize_clusters_tsne(embeddings, labels, title, save_path):
-    tsne = TSNE(n_components=2, perplexity=30, max_iter=1000)
-    reduced = tsne.fit_transform(embeddings)
-    return plot_clusters(reduced, labels, f"{title} (t-SNE)", save_path)
-
-
-def plot_clusters(reduced_embeddings, labels, title, save_path):
-    plt.figure(figsize=(10, 8))
-    scatter = plt.scatter(
-        reduced_embeddings[:, 0], reduced_embeddings[:, 1], c=labels, cmap="viridis"
-    )
-    plt.colorbar(scatter)
-    plt.title(title)
-    plt.xlabel("Component 1")
-    plt.ylabel("Component 2")
-    plt.savefig(save_path)
-    plt.close()
-
-
 def visualize_clusters(
-    embeddings: np.ndarray, labels: np.ndarray, title: str, save_path: str
+    embeddings: torch.Tensor,
+    labels: np.ndarray,
+    title: str,
+    save_path: str,
+    metric_name: str,
 ):
     """Plot clusters using both PCA and t-SNE side by side"""
     # Create figure with two subplots
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
+
+    # Convert cuda:0 to cpu if needed
+    if isinstance(embeddings, torch.Tensor):
+        embeddings = embeddings.detach().cpu().numpy()
 
     # PCA reduction
     pca = PCA(n_components=2)
@@ -629,7 +760,7 @@ def visualize_clusters(
     scatter1 = ax1.scatter(
         pca_embeddings[:, 0], pca_embeddings[:, 1], c=labels, cmap="viridis"
     )
-    ax1.set_title("PCA Projection")
+    ax1.set_title(f"PCA Projection - {metric_name}")
     ax1.set_xlabel("First Principal Component")
     ax1.set_ylabel("Second Principal Component")
 
@@ -637,7 +768,7 @@ def visualize_clusters(
     scatter2 = ax2.scatter(
         tsne_embeddings[:, 0], tsne_embeddings[:, 1], c=labels, cmap="viridis"
     )
-    ax2.set_title("t-SNE Projection")
+    ax2.set_title(f"t-SNE Projection - {metric_name}")
     ax2.set_xlabel("First Component")
     ax2.set_ylabel("Second Component")
 
@@ -646,11 +777,12 @@ def visualize_clusters(
     plt.colorbar(scatter2, ax=ax2)
 
     # Set main title
-    fig.suptitle(title, fontsize=16)
+    fig.suptitle(f"{title} - {metric_name}", fontsize=16)
 
     # Adjust layout and save
     plt.tight_layout()
-    plt.savefig(save_path)
+    save_file = os.path.join(save_path, f"clusters_{title}_{metric_name}.png")
+    plt.savefig(save_file)
     plt.close()
 
 
